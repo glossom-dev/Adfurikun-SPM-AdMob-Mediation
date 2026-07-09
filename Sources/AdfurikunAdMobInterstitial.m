@@ -1,0 +1,228 @@
+//
+//  AdfurikunAdMobInterstitial.m
+//
+//  Copyright © 2019 Glossom.Inc. All rights reserved.
+//
+
+#import "AdfurikunAdMobInterstitial.h"
+#import "AdfurikunAdnetworkExtra.h"
+#include <stdatomic.h>
+#import <ADFMovieReward/AdfurikunSdk.h>
+
+@interface AdfurikunAdMobInterstitial ()
+@property(nonatomic, weak, nullable) id<GADMediationInterstitialAdEventDelegate> adEventDelegate;
+@property(nonatomic) GADMediationInterstitialLoadCompletionHandler loadCompletionHandler;
+@property (nonatomic) NSDictionary *customParameter;
+@end
+
+@implementation AdfurikunAdMobInterstitial
+
+#pragma mark GADMediationAdapter
+
+- (void)loadInterstitialForAdConfiguration:(GADMediationInterstitialAdConfiguration *)adConfiguration completionHandler:(GADMediationInterstitialLoadCompletionHandler)completionHandler {
+    __block atomic_flag completionHandlerCalled = ATOMIC_FLAG_INIT;
+    __block GADMediationInterstitialLoadCompletionHandler originalCompletionHandler = [completionHandler copy];
+    
+    self.loadCompletionHandler = ^id<GADMediationInterstitialAdEventDelegate>(_Nullable id<GADMediationInterstitialAd> ad, NSError *_Nullable error) {
+        // Only allow completion handler to be called once.
+        if (atomic_flag_test_and_set(&completionHandlerCalled)) {
+            return nil;
+        }
+        
+        id<GADMediationInterstitialAdEventDelegate> delegate = nil;
+        if (originalCompletionHandler) {
+            // Call original handler and hold on to its return value.
+            delegate = originalCompletionHandler(ad, error);
+        }
+        
+        // Release reference to handler. Objects retained by the handler will also
+        // be released.
+        originalCompletionHandler = nil;
+        
+        return delegate;
+    };
+    NSString *appId = adConfiguration.credentials.settings[@"parameter"];
+    float loadTimeout = 0.0;
+    self.customParameter = nil;
+    
+    AdfurikunAdnetworkExtra *extra = (AdfurikunAdnetworkExtra *)adConfiguration.extras;
+    if (extra) {
+        loadTimeout = extra.loadTimeout;
+
+        [extra adfurikunSDKInitProcessWithTestMode:adConfiguration.isTestRequest];
+        
+        if (extra.customParameter) {
+            self.customParameter = [NSDictionary dictionaryWithDictionary:extra.customParameter];
+        }
+    }
+    AdMobMediationTrace;
+    if (appId) {
+        self.interstitialAd = [ADFmyInterstitial getInstance:appId delegate:self];
+        if (loadTimeout > 0.0) {
+            [self.interstitialAd loadWithTimeout:loadTimeout];
+        } else {
+            [self.interstitialAd load];
+        }
+    }
+}
+
++ (GADVersionNumber)adSDKVersion { 
+    NSString *versionString = AdfurikunSdk.version;
+    NSMutableArray *versionComponents = [[versionString componentsSeparatedByString:@"."] mutableCopy];
+    GADVersionNumber version = {0};
+    if (versionComponents.count == 3) {
+        [versionComponents addObject:@"0"];
+    }
+    if (versionComponents.count == 4) {
+        version.majorVersion = [versionComponents[0] integerValue];
+        version.minorVersion = [versionComponents[1] integerValue];
+        
+        // Adapter versions have 2 patch versions. Multiply the first patch by 100.
+        version.patchVersion = [versionComponents[2] integerValue] * 100
+        + [versionComponents[3] integerValue];
+    }
+    return version;
+}
+
+
++ (GADVersionNumber)adapterVersion {
+    NSString *versionString = @"2.0.1";
+    NSArray *versionComponents = [versionString componentsSeparatedByString:@"."];
+    GADVersionNumber version = {0};
+    if (versionComponents.count == 3) {
+        version.majorVersion = [versionComponents[0] integerValue];
+        version.minorVersion = [versionComponents[1] integerValue];
+        version.patchVersion = [versionComponents[2] integerValue];
+    }
+    return version;
+}
+
+
++ (nullable Class<GADAdNetworkExtras>)networkExtrasClass { 
+    return AdfurikunAdnetworkExtra.class;
+}
+
+#pragma mark GADMediationInterstitialAd
+
+- (void)presentFromViewController:(UIViewController *)viewController {
+    AdMobMediationTrace;
+    if ([self.interstitialAd isPrepared]) {
+        [self.interstitialAd playWithCustomParam:self.customParameter];
+    } else if (self.adEventDelegate && [self.adEventDelegate respondsToSelector:@selector(didFailToPresentWithError:)]) {
+        NSString *message = @"ad was not loaded.";
+        NSError *error = [NSError errorWithDomain:@"jp.greex.adfurikun.error"
+                                             code:0
+                                         userInfo:@{NSLocalizedDescriptionKey: message,
+                                                    NSLocalizedRecoverySuggestionErrorKey: message}];
+        AdMobMediationLog(@"adEventDelegate didFailToPresentWithError called, errorCode: 0, errorMessage: %@", message);
+        [self.adEventDelegate didFailToPresentWithError:error];
+    }
+}
+
+#pragma mark ADFmyMovieRewardDelegate
+
+- (void)AdsFetchCompleted:(NSString *)appID isTestMode:(BOOL)isTestMode_inApp {
+    AdMobMediationTrace;
+    if (self.loadCompletionHandler) {
+        self.adEventDelegate = self.loadCompletionHandler(self, nil);
+    }
+}
+
+- (void)AdsFetchFailed:(NSString *)appID adfError:(ADFError *)adfError adnetworkError:(NSArray<AdnetworkError *> *)adnetworkError {
+    AdMobMediationTrace;
+    if (adfError) {
+        AdMobMediationLog(@"ADFError code=%d, message=%@",
+                                  adfError.errorCode,
+                                  adfError.errorMessage);
+    }
+    if (adnetworkError) {
+        for (AdnetworkError *networkError in adnetworkError) {
+            AdMobMediationLog(@"AdnetworkError adnetworkKey=%@, code=%ld, message=%@",
+                              networkError.adnetworkKey,
+                              networkError.errorCode,
+                              networkError.errorMessage);
+        }
+    }
+    
+    if (self.loadCompletionHandler) {
+        NSDictionary *userInfo = @{
+            NSLocalizedDescriptionKey: adfError.errorMessage
+        };
+        NSError *err = [[NSError alloc] initWithDomain:@"jp.greex.adfurikun.error" code:adfError.errorCode userInfo:userInfo];
+        self.adEventDelegate = self.loadCompletionHandler(nil, err);
+    }
+}
+
+- (void)AdsPlayFailed:(NSString *)appID adfError:(ADFError *)adfError adnetworkError:(AdnetworkError *)adnetworkError {
+    AdMobMediationTrace;
+    if (adfError) {
+        AdMobMediationLog(@"ADFError code=%d, message=%@",
+                          adfError.errorCode,
+                          adfError.errorMessage);
+    }
+    if (adnetworkError) {
+        AdMobMediationLog(@"AdnetworkError adnetworkKey=%@, code=%ld, message=%@",
+                          adnetworkError.adnetworkKey,
+                          adnetworkError.errorCode,
+                          adnetworkError.errorMessage);
+    }
+    
+    if (self.adEventDelegate && [self.adEventDelegate respondsToSelector:@selector(didFailToPresentWithError:)]) {
+        NSString *errorMessage = @"";
+        NSInteger errorCode = 0;
+        if (adnetworkError) {
+            if (adnetworkError.errorMessage) {
+                errorMessage = adnetworkError.errorMessage;
+            }
+            errorCode = adnetworkError.errorCode;
+        } else if (adfError) {
+            if (adfError.errorMessage) {
+                errorMessage = adfError.errorMessage;
+            }
+            errorCode = adfError.errorCode;
+        }
+        NSError *error = [NSError errorWithDomain:@"jp.greex.adfurikun.error"
+                                             code:errorCode
+                                         userInfo:@{NSLocalizedDescriptionKey: errorMessage,
+                                                    NSLocalizedRecoverySuggestionErrorKey: errorMessage}];
+        [self.adEventDelegate didFailToPresentWithError:error];
+    }
+}
+
+- (void)AdsDidShow:(NSString *)appID adnetworkKey:(NSString *)adnetworkKey {
+    AdMobMediationTrace;
+    if (!self.adEventDelegate) {
+        AdMobMediationLog(@"adEventDelegate is nil");
+        return;
+    }
+    if ([self.adEventDelegate respondsToSelector:@selector(willPresentFullScreenView)]) {
+        AdMobMediationLog(@"adEventDelegate willPresentFullScreenView called");
+        [self.adEventDelegate willPresentFullScreenView];
+    }
+    if ([self.adEventDelegate respondsToSelector:@selector(reportImpression)]) {
+        AdMobMediationLog(@"adEventDelegate reportImpression called");
+        [self.adEventDelegate reportImpression];
+    }
+}
+
+- (void)AdsDidCompleteShow:(NSString *)appID {
+    AdMobMediationTrace;
+}
+
+- (void)AdsDidHide:(NSString *)appID isRewarded:(_Bool)rewarded {
+    AdMobMediationTrace;
+    if (!self.adEventDelegate) {
+        AdMobMediationLog(@"adEventDelegate is nil");
+        return;
+    }
+    if ([self.adEventDelegate respondsToSelector:@selector(willDismissFullScreenView)]) {
+        AdMobMediationLog(@"adEventDelegate willDismissFullScreenView called");
+        [self.adEventDelegate willDismissFullScreenView];
+    }
+    if ([self.adEventDelegate respondsToSelector:@selector(didDismissFullScreenView)]) {
+        AdMobMediationLog(@"adEventDelegate didDismissFullScreenView called");
+        [self.adEventDelegate didDismissFullScreenView];
+    }
+}
+
+@end
